@@ -1,0 +1,12 @@
+dist/
+logs/
+__pycache__/
+*.pyc
+*.pyo
+.env
+socks5.url
+*.log
+.pytest_cache/
+.DS_Store
+Thumbs.db
+
