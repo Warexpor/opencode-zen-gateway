@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.0 — 2026-09-18
+
+- Free tier now requires a real semver User-Agent, an OpenCode session id, `stream: true`, and the builtin tool set. Default version is `1.18.31`.
+- Session and request ids match `Identifier.create` (`ses_`/`msg_` + 12 hex + 14 base62). Other session ids are not forwarded.
+- Upstream inference bodies always stream and include `builtin_tools.json`. Non-streaming clients still get one JSON response.
+
 ## 0.1.6 — 2026-08-12
 
 - Public repo polish: MIT license, README for third-party clones, LICENSE included in the share zip.

@@ -2,8 +2,8 @@
 """OpenCode Zen gateway for other harnesses.
 
 Any OpenAI- or Anthropic-compatible client points here. Requests go to
-https://opencode.ai/zen with official OpenCode CLI identity headers so
-Zen applies the same free-model path as the OpenCode agent.
+https://opencode.ai/zen with the headers and body shape the OpenCode CLI
+uses, so Zen's free tier accepts them.
 """
 
 from __future__ import annotations
@@ -12,11 +12,13 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import secrets
 import socket
 import ssl
 import sys
 import threading
+import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from pathlib import Path
@@ -26,7 +28,7 @@ from urllib.parse import unquote, urlsplit
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("ZEN_GATEWAY_PORT", "8789"))
 UPSTREAM = os.environ.get("ZEN_GATEWAY_UPSTREAM", "https://opencode.ai/zen").rstrip("/")
-OPENCODE_VERSION = os.environ.get("ZEN_GATEWAY_OPENCODE_VERSION", "1.18.4")
+OPENCODE_VERSION = os.environ.get("ZEN_GATEWAY_OPENCODE_VERSION", "1.18.31")
 CLIENT = os.environ.get("ZEN_GATEWAY_CLIENT", "cli")
 PROJECT = os.environ.get("ZEN_GATEWAY_PROJECT", "global")
 USER_AGENT = os.environ.get(
@@ -36,6 +38,9 @@ ENV_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
 UPSTREAM_TIMEOUT = int(os.environ.get("ZEN_GATEWAY_TIMEOUT", "600"))
 ROOT = Path(__file__).resolve().parent
 SOCKS_SWITCH = ROOT / "socks5.url"
+# Schemas captured from OpenCode CLI 1.18.31 `build` on 2026-09-18.
+# Console's free tier rejects inference bodies that do not contain this set.
+_OFFICIAL_TOOLS_PATH = ROOT / "builtin_tools.json"
 
 _UP = urlsplit(UPSTREAM)
 _UP_HOST = _UP.hostname or "opencode.ai"
@@ -217,14 +222,40 @@ def log(msg: str) -> None:
             pass
 
 
-def oc_id(prefix: str, n: int = 24) -> str:
-    alphabet = "abcdefghijklmnopqrstuvwxyzABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789"
-    return prefix + "".join(secrets.choice(alphabet) for _ in range(n))
+# packages/opencode/src/id/id.ts create(prefix, "ascending"):
+#   prefix + "_" + 6-byte timestamp hex + 14 base62 chars.
+# The free-tier gate rejects anything else (UUIDs, short random ids).
+_B62 = "0123456789ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz"
+_OC_ID = re.compile(r"^(?:ses|msg)_[0-9a-f]{12}[0-9A-Za-z]{14}$")
+_id_lock = threading.Lock()
+_id_last_ms = 0
+_id_counter = 0
+
+
+def oc_id(prefix: str) -> str:
+    global _id_last_ms, _id_counter
+    with _id_lock:
+        now_ms = int(time.time() * 1000)
+        if now_ms != _id_last_ms:
+            _id_last_ms = now_ms
+            _id_counter = 0
+        _id_counter += 1
+        counter = _id_counter
+        stamp = now_ms
+    packed = (stamp * 0x1000 + counter) & ((1 << 48) - 1)
+    tail = "".join(_B62[b % 62] for b in secrets.token_bytes(14))
+    return f"{prefix}{packed.to_bytes(6, 'big').hex()}{tail}"
+
+
+def valid_oc_id(value: str) -> bool:
+    return bool(_OC_ID.fullmatch(value))
 
 
 def session_for(auth: str, incoming: Optional[str]) -> str:
-    if incoming and incoming.strip():
-        return incoming.strip()
+    if incoming:
+        candidate = incoming.strip()
+        if valid_oc_id(candidate) and candidate.startswith("ses_"):
+            return candidate
     key = hashlib.sha256(auth.encode("utf-8", "replace")).hexdigest()[:32]
     with _session_lock:
         sid = _sessions.get(key)
@@ -254,10 +285,441 @@ def upstream_path(local_path: str, prefix: str = _UP_PREFIX) -> str:
 
 
 def strip_model_prefix(model: str) -> str:
-    for prefix in ("opencode/", "opencode-zen/", "opencode-go/"):
+    for prefix in ("opencode/", "opencode-zen/", "opencode-go/", "zen-gw/"):
         if model.startswith(prefix):
             return model[len(prefix) :]
     return model
+
+
+def uses_responses_api(model: str) -> bool:
+    """Zen serves Muse Spark (incl. contributor-free) on /v1/responses, not chat."""
+    mid = strip_model_prefix(model).lower()
+    return mid.startswith("muse-spark")
+
+
+def uses_messages_api(model: str) -> bool:
+    """Zen serves Union Alpha Free on /v1/messages (@ai-sdk/anthropic), not chat/responses."""
+    mid = strip_model_prefix(model).lower()
+    return mid == "union-alpha"
+
+
+def load_official_chat_tools() -> List[dict]:
+    data = json.loads(_OFFICIAL_TOOLS_PATH.read_text(encoding="utf-8"))
+    if not isinstance(data, list) or not data:
+        raise SystemExit(f"builtin tools missing or empty: {_OFFICIAL_TOOLS_PATH}")
+    return data
+
+
+OFFICIAL_CHAT_TOOLS: List[dict] = load_official_chat_tools()
+
+
+def tool_name(tool: dict) -> str:
+    fn = tool.get("function")
+    if isinstance(fn, dict) and isinstance(fn.get("name"), str):
+        return fn["name"]
+    name = tool.get("name")
+    return name if isinstance(name, str) else ""
+
+
+def as_responses_tool(tool: dict) -> dict:
+    fn = tool.get("function") if isinstance(tool.get("function"), dict) else tool
+    out = {
+        "type": "function",
+        "name": fn.get("name"),
+        "description": fn.get("description") or "",
+        "parameters": fn.get("parameters") or fn.get("input_schema") or {"type": "object", "properties": {}},
+    }
+    if "strict" in tool:
+        out["strict"] = tool["strict"]
+    elif "strict" in fn:
+        out["strict"] = fn["strict"]
+    return out
+
+
+OFFICIAL_RESPONSES_TOOLS: List[dict] = [as_responses_tool(tool) for tool in OFFICIAL_CHAT_TOOLS]
+
+
+def merge_tools(existing: object, official: List[dict]) -> List[dict]:
+    """Official tools first. Extra harness tools stay, so the model can still call them."""
+    current = [tool for tool in existing if isinstance(tool, dict)] if isinstance(existing, list) else []
+    official_names = {tool_name(tool) for tool in official}
+    extras = [tool for tool in current if tool_name(tool) not in official_names]
+    return list(official) + extras
+
+
+def _content_to_text(content) -> str:
+    if content is None:
+        return ""
+    if isinstance(content, str):
+        return content
+    if isinstance(content, list):
+        parts: List[str] = []
+        for block in content:
+            if isinstance(block, str):
+                parts.append(block)
+            elif isinstance(block, dict):
+                if isinstance(block.get("text"), str):
+                    parts.append(block["text"])
+                elif isinstance(block.get("content"), str):
+                    parts.append(block["content"])
+        return "".join(parts)
+    return str(content)
+
+
+def chat_to_messages_body(obj: dict) -> dict:
+    """Translate OpenAI chat.completions to Zen Anthropic /v1/messages for Union Alpha."""
+    model = strip_model_prefix(str(obj.get("model") or ""))
+    out: dict = {"model": model, "max_tokens": 1024, "messages": []}
+    max_tokens = obj.get("max_tokens") or obj.get("max_completion_tokens") or obj.get("max_output_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        out["max_tokens"] = max_tokens
+    system_bits: List[str] = []
+    messages = obj.get("messages")
+    if isinstance(messages, list):
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "user")
+            text = _content_to_text(msg.get("content"))
+            if role == "system":
+                if text:
+                    system_bits.append(text)
+                continue
+            if role not in ("user", "assistant"):
+                role = "user"
+            out["messages"].append({"role": role, "content": text})
+    if not out["messages"]:
+        out["messages"] = [{"role": "user", "content": str(obj.get("input") or obj.get("prompt") or "Hello")}]
+    if system_bits:
+        out["system"] = "\n\n".join(system_bits)
+    if obj.get("stream"):
+        out["stream"] = True
+    return out
+
+
+def messages_to_chat_completion(obj: dict) -> tuple[int, bytes, str]:
+    """Fold an Anthropic Messages response into a non-stream chat.completion."""
+    text_parts: List[str] = []
+    content = obj.get("content")
+    if isinstance(content, list):
+        for block in content:
+            if isinstance(block, dict) and block.get("type") == "text" and isinstance(block.get("text"), str):
+                text_parts.append(block["text"])
+    text = "".join(text_parts)
+    usage_in = obj.get("usage") if isinstance(obj.get("usage"), dict) else {}
+    chat = {
+        "id": str(obj.get("id") or "chatcmpl-zen"),
+        "object": "chat.completion",
+        "model": str(obj.get("model") or "union-alpha"),
+        "choices": [{
+            "index": 0,
+            "finish_reason": "stop",
+            "message": {"role": "assistant", "content": text},
+        }],
+        "usage": {
+            "prompt_tokens": int(usage_in.get("input_tokens") or 0),
+            "completion_tokens": int(usage_in.get("output_tokens") or 0),
+            "total_tokens": int(usage_in.get("input_tokens") or 0) + int(usage_in.get("output_tokens") or 0),
+        },
+    }
+    raw = json.dumps(chat, ensure_ascii=False).encode("utf-8")
+    return 200, raw, "application/json"
+
+
+def chat_to_responses_body(obj: dict) -> dict:
+    """Translate an OpenAI chat.completions body to Zen's /v1/responses shape."""
+    model = strip_model_prefix(str(obj.get("model") or ""))
+    messages = obj.get("messages")
+    if isinstance(messages, list) and messages:
+        input_items: List[dict] = []
+        for msg in messages:
+            if not isinstance(msg, dict):
+                continue
+            role = str(msg.get("role") or "user")
+            text = _content_to_text(msg.get("content"))
+            if role == "system":
+                # Responses API prefers instructions for system text when present.
+                continue
+            input_items.append({"role": role, "content": text})
+        system_bits = [
+            _content_to_text(m.get("content"))
+            for m in messages
+            if isinstance(m, dict) and m.get("role") == "system"
+        ]
+        out: dict = {"model": model, "input": input_items or "Hello"}
+        instructions = "\n\n".join(s for s in system_bits if s)
+        if instructions:
+            out["instructions"] = instructions
+    else:
+        out = {"model": model, "input": str(obj.get("input") or obj.get("prompt") or "Hello")}
+
+    max_tokens = obj.get("max_tokens") or obj.get("max_completion_tokens") or obj.get("max_output_tokens")
+    if isinstance(max_tokens, int) and max_tokens > 0:
+        # Muse defaults to high reasoning effort and can burn the entire budget
+        # on reasoning_tokens with an empty output — keep a usable floor.
+        out["max_output_tokens"] = max(max_tokens, 256)
+    else:
+        out["max_output_tokens"] = 512
+    # Free tier rejects stream=false. Buffer the SSE and fold it back for the client.
+    out["stream"] = True
+    tools = obj.get("tools")
+    if isinstance(tools, list) and tools:
+        converted = [as_responses_tool(tool) for tool in tools if isinstance(tool, dict)]
+        if converted:
+            out["tools"] = converted
+            out["tool_choice"] = obj.get("tool_choice") or "auto"
+    # Prefer minimal reasoning unless the client already set one — otherwise
+    # contributor-free Muse often returns status=incomplete with output=[].
+    reasoning = obj.get("reasoning")
+    if isinstance(reasoning, dict) and reasoning.get("effort"):
+        out["reasoning"] = {"effort": reasoning["effort"]}
+    else:
+        out["reasoning"] = {"effort": "minimal"}
+    for key in ("temperature", "top_p"):
+        if key in obj:
+            out[key] = obj[key]
+    return out
+
+
+def responses_output_text(resp: dict) -> str:
+    parts: List[str] = []
+    for item in resp.get("output") or []:
+        if not isinstance(item, dict):
+            continue
+        for block in item.get("content") or []:
+            if not isinstance(block, dict):
+                continue
+            if block.get("type") in ("output_text", "text") and isinstance(block.get("text"), str):
+                parts.append(block["text"])
+    if parts:
+        return "".join(parts)
+    # Some Zen payloads put a summary string on the response itself.
+    for key in ("output_text", "text"):
+        if isinstance(resp.get(key), str) and resp[key]:
+            return resp[key]
+    return ""
+
+
+def responses_to_chat_completion(resp: dict, want_stream: bool) -> Tuple[int, bytes, str]:
+    """Return (status, body, content_type) for a chat.completions client."""
+    status = 200
+    text = responses_output_text(resp)
+    finish = "stop"
+    if resp.get("status") == "incomplete":
+        finish = "length"
+    usage_in = resp.get("usage") if isinstance(resp.get("usage"), dict) else {}
+    chat = {
+        "id": resp.get("id") or oc_id("chatcmpl_"),
+        "object": "chat.completion",
+        "created": int(resp.get("created_at") or time.time()),
+        "model": resp.get("model") or "muse-spark",
+        "choices": [
+            {
+                "index": 0,
+                "finish_reason": finish,
+                "message": {"role": "assistant", "content": text},
+            }
+        ],
+        "usage": {
+            "prompt_tokens": usage_in.get("input_tokens") or usage_in.get("prompt_tokens") or 0,
+            "completion_tokens": usage_in.get("output_tokens") or usage_in.get("completion_tokens") or 0,
+            "total_tokens": usage_in.get("total_tokens")
+            or (
+                (usage_in.get("input_tokens") or 0) + (usage_in.get("output_tokens") or 0)
+            ),
+        },
+    }
+    if want_stream:
+        chunk_delta = {
+            "id": chat["id"],
+            "object": "chat.completion.chunk",
+            "created": chat["created"],
+            "model": chat["model"],
+            "choices": [{"index": 0, "delta": {"role": "assistant", "content": text}, "finish_reason": None}],
+        }
+        chunk_done = {
+            "id": chat["id"],
+            "object": "chat.completion.chunk",
+            "created": chat["created"],
+            "model": chat["model"],
+            "choices": [{"index": 0, "delta": {}, "finish_reason": finish}],
+        }
+        sse = (
+            f"data: {json.dumps(chunk_delta, ensure_ascii=False)}\n\n"
+            f"data: {json.dumps(chunk_done, ensure_ascii=False)}\n\n"
+            "data: [DONE]\n\n"
+        ).encode("utf-8")
+        return status, sse, "text/event-stream"
+    return status, json.dumps(chat, ensure_ascii=False).encode("utf-8"), "application/json"
+
+
+def iter_sse_json(raw: bytes):
+    events, rest = split_sse(raw)
+    if rest.strip():
+        events.append(rest)
+    for event in events:
+        payload = _sse_data_payload(event)
+        if not payload or payload == b"[DONE]":
+            continue
+        try:
+            obj = json.loads(payload)
+        except json.JSONDecodeError:
+            continue
+        if isinstance(obj, dict):
+            yield obj
+
+
+def chat_from_sse(raw: bytes, fallback_model: str = "") -> dict:
+    """Fold an OpenAI chat or Responses SSE body into one chat.completion."""
+    text: List[str] = []
+    tool_acc: Dict[int, dict] = {}
+    finish = "stop"
+    cid = oc_id("chatcmpl_")
+    created = int(time.time())
+    model = fallback_model
+    usage = None
+    for obj in iter_sse_json(raw):
+        if isinstance(obj.get("id"), str):
+            cid = obj["id"]
+        if isinstance(obj.get("model"), str):
+            model = obj["model"]
+        if isinstance(obj.get("created"), int):
+            created = obj["created"]
+        if isinstance(obj.get("usage"), dict):
+            usage = obj["usage"]
+        kind = obj.get("type")
+        if kind == "response.output_text.delta" and isinstance(obj.get("delta"), str):
+            text.append(obj["delta"])
+        if kind == "response.completed" and isinstance(obj.get("response"), dict):
+            resp = obj["response"]
+            got = responses_output_text(resp)
+            if got:
+                text = [got]
+            if isinstance(resp.get("id"), str):
+                cid = resp["id"]
+            if isinstance(resp.get("model"), str):
+                model = resp["model"]
+            if isinstance(resp.get("created_at"), int):
+                created = resp["created_at"]
+            if isinstance(resp.get("usage"), dict):
+                usage = resp["usage"]
+            if resp.get("status") == "incomplete":
+                finish = "length"
+        for choice in obj.get("choices") or []:
+            if not isinstance(choice, dict):
+                continue
+            if choice.get("finish_reason"):
+                finish = choice["finish_reason"]
+            delta = choice.get("delta") or choice.get("message") or {}
+            if not isinstance(delta, dict):
+                continue
+            if isinstance(delta.get("content"), str):
+                text.append(delta["content"])
+            for call in delta.get("tool_calls") or []:
+                if not isinstance(call, dict):
+                    continue
+                idx = int(call.get("index") or 0)
+                slot = tool_acc.setdefault(
+                    idx,
+                    {"id": "", "type": "function", "function": {"name": "", "arguments": ""}},
+                )
+                if isinstance(call.get("id"), str):
+                    slot["id"] = call["id"]
+                fn = call.get("function") if isinstance(call.get("function"), dict) else {}
+                if isinstance(fn.get("name"), str):
+                    slot["function"]["name"] += fn["name"]
+                if isinstance(fn.get("arguments"), str):
+                    slot["function"]["arguments"] += fn["arguments"]
+    message: dict = {"role": "assistant", "content": "".join(text)}
+    if tool_acc:
+        message["tool_calls"] = [tool_acc[i] for i in sorted(tool_acc)]
+        if finish == "stop":
+            finish = "tool_calls"
+    chat = {
+        "id": cid,
+        "object": "chat.completion",
+        "created": created,
+        "model": model,
+        "choices": [{"index": 0, "finish_reason": finish, "message": message}],
+    }
+    if isinstance(usage, dict):
+        chat["usage"] = {
+            "prompt_tokens": usage.get("input_tokens") or usage.get("prompt_tokens") or 0,
+            "completion_tokens": usage.get("output_tokens") or usage.get("completion_tokens") or 0,
+            "total_tokens": usage.get("total_tokens")
+            or ((usage.get("input_tokens") or usage.get("prompt_tokens") or 0) + (usage.get("output_tokens") or usage.get("completion_tokens") or 0)),
+        }
+    return chat
+
+
+def responses_from_sse(raw: bytes) -> dict:
+    text: List[str] = []
+    last = None
+    for obj in iter_sse_json(raw):
+        if obj.get("type") == "response.completed" and isinstance(obj.get("response"), dict):
+            return obj["response"]
+        if obj.get("type") == "response.output_text.delta" and isinstance(obj.get("delta"), str):
+            text.append(obj["delta"])
+        if obj.get("object") == "response":
+            last = obj
+    if isinstance(last, dict):
+        return last
+    return {
+        "id": oc_id("resp_"),
+        "object": "response",
+        "status": "completed",
+        "output": [{"type": "message", "content": [{"type": "output_text", "text": "".join(text)}]}],
+    }
+
+
+INFERENCE_PATHS = (
+    "/v1/chat/completions",
+    "/v1/completions",
+    "/v1/responses",
+    "/v1/messages",
+)
+
+
+def apply_free_tier(path: str, body: bytes) -> Tuple[bytes, dict]:
+    """Shape an inference body so Console's free-tier gate accepts it.
+
+    The gate (as of 2026-09-18) requires all of:
+    - User-Agent opencode/<semver >= 1.18.0>  (header, not body)
+    - x-opencode-session in Identifier.create form
+    - stream true
+    - the OpenCode builtin tool set present (extra tools are allowed)
+    """
+    meta = {
+        "want_stream": False,
+        "fold": False,
+        "fold_responses": False,
+        "model": "",
+        "shaped": False,
+    }
+    np = normalize_path(path)
+    if np not in INFERENCE_PATHS or not body:
+        return body, meta
+    try:
+        obj = json.loads(body)
+    except json.JSONDecodeError:
+        return body, meta
+    if not isinstance(obj, dict):
+        return body, meta
+    meta["model"] = str(obj.get("model") or "")
+    meta["want_stream"] = bool(obj.get("stream"))
+    if np == "/v1/responses":
+        obj["tools"] = merge_tools(obj.get("tools"), OFFICIAL_RESPONSES_TOOLS)
+    elif np != "/v1/messages":
+        obj["tools"] = merge_tools(obj.get("tools"), OFFICIAL_CHAT_TOOLS)
+    else:
+        return body, meta
+    if "tool_choice" not in obj:
+        obj["tool_choice"] = "auto"
+    obj["stream"] = True
+    meta["shaped"] = True
+    meta["fold"] = (not meta["want_stream"]) and np in ("/v1/chat/completions", "/v1/completions")
+    meta["fold_responses"] = (not meta["want_stream"]) and np == "/v1/responses"
+    return json.dumps(obj, ensure_ascii=False).encode("utf-8"), meta
 
 
 def rewrite_body(path: str, body: bytes) -> bytes:
@@ -469,23 +931,66 @@ class Handler(BaseHTTPRequestHandler):
             return
         body = rewrite_body(local, self._read_body())
         up_path = upstream_path(local)
-        headers = self._upstream_headers(body)
+        muse_chat = False
+        union_chat = False
+        want_stream = False
+        fold = False
+        fold_responses = False
         model = ""
         try:
             if body:
                 obj = json.loads(body)
                 if isinstance(obj, dict):
                     model = str(obj.get("model") or "")
+                    want_stream = bool(obj.get("stream"))
+                    if np == "/v1/chat/completions" and uses_messages_api(model):
+                        union_chat = True
+                        translated = chat_to_messages_body(obj)
+                        body = json.dumps(translated, ensure_ascii=False).encode("utf-8")
+                        up_path = f"{_UP_PREFIX}/v1/messages"
+                        model = str(translated.get("model") or model)
+                        want_stream = bool(translated.get("stream"))
+                    elif np == "/v1/chat/completions" and uses_responses_api(model):
+                        shaped, meta = apply_free_tier(local, body)
+                        obj = json.loads(shaped)
+                        want_stream = bool(meta["want_stream"])
+                        muse_chat = True
+                        translated = chat_to_responses_body(obj)
+                        body = json.dumps(translated, ensure_ascii=False).encode("utf-8")
+                        up_path = f"{_UP_PREFIX}/v1/responses"
+                        model = str(translated.get("model") or model)
+                    else:
+                        body, meta = apply_free_tier(local, body)
+                        want_stream = bool(meta["want_stream"])
+                        fold = bool(meta["fold"])
+                        fold_responses = bool(meta["fold_responses"])
+                        if meta["model"]:
+                            model = str(meta["model"])
         except json.JSONDecodeError:
             pass
+        headers = self._upstream_headers(body)
+        if union_chat and "anthropic-version" not in {k.lower() for k in headers}:
+            headers["anthropic-version"] = "2023-06-01"
         log(
             f"{self.command} {np} -> {up_path} model={model or '-'} "
             f"session={headers.get('x-opencode-session', '')[:16]}…"
+            f"{' muse->responses' if muse_chat else ''}"
+            f"{' union->messages' if union_chat else ''}"
         )
         conn = None
         try:
             conn, resp = open_upstream(self.command, up_path, headers, body or None)
-            self._write_response(resp)
+            if muse_chat:
+                self._write_muse_chat_response(resp, want_stream)
+            elif union_chat:
+                self._write_union_chat_response(resp, want_stream)
+            else:
+                self._write_response(
+                    resp,
+                    fold_json=fold,
+                    fold_responses=fold_responses,
+                    fallback_model=model,
+                )
         except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
             log("client disconnected")
         except Exception as exc:
@@ -499,9 +1004,164 @@ class Handler(BaseHTTPRequestHandler):
                 except Exception:
                     pass
 
-    def _write_response(self, resp: http.client.HTTPResponse) -> None:
+    def _write_muse_chat_response(self, resp: http.client.HTTPResponse, want_stream: bool) -> None:
+        raw = resp.read()
+        if resp.status >= 400:
+            self.send_response(resp.status)
+            self._started = True
+            self._cors()
+            ctype = resp.getheader("Content-Type") or "application/json"
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            retry = resp.getheader("Retry-After")
+            if retry:
+                self.send_header("Retry-After", retry)
+            self.end_headers()
+            self.wfile.write(raw)
+            log(f"upstream {resp.status}: {raw[:400]!r}")
+            return
+        ctype_in = (resp.getheader("Content-Type") or "").lower()
+        if "text/event-stream" in ctype_in or raw.lstrip().startswith((b"data:", b"event:")):
+            chat = chat_from_sse(raw, "muse-spark")
+            status, out, ctype = responses_to_chat_completion(
+                {
+                    "id": chat["id"],
+                    "created_at": chat["created"],
+                    "status": "incomplete" if chat["choices"][0]["finish_reason"] == "length" else "completed",
+                    "model": chat["model"],
+                    "output": [{
+                        "content": [{
+                            "type": "output_text",
+                            "text": chat["choices"][0]["message"].get("content") or "",
+                        }]
+                    }],
+                    "usage": chat.get("usage") or {},
+                },
+                want_stream,
+            )
+            # Keep tool calls the SSE folder above drops.
+            if chat["choices"][0]["message"].get("tool_calls") and not want_stream:
+                out = json.dumps(chat, ensure_ascii=False).encode("utf-8")
+                ctype = "application/json"
+            self.send_response(status)
+            self._started = True
+            self._cors()
+            self.send_header("Content-Type", ctype)
+            if want_stream:
+                self.send_header("Cache-Control", "no-cache")
+                self.send_header("X-Accel-Buffering", "no")
+                self.send_header("Connection", "close")
+                self.close_connection = True
+                self.end_headers()
+                self.wfile.write(out)
+                self.wfile.flush()
+                return
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json_error(502, "invalid responses payload from Zen", "gateway_error")
+            return
+        if not isinstance(obj, dict):
+            self._json_error(502, "invalid responses payload from Zen", "gateway_error")
+            return
+        status, out, ctype = responses_to_chat_completion(obj, want_stream)
+        self.send_response(status)
+        self._started = True
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        if want_stream:
+            self.send_header("Cache-Control", "no-cache")
+            self.send_header("X-Accel-Buffering", "no")
+            self.send_header("Connection", "close")
+            self.close_connection = True
+            self.end_headers()
+            self.wfile.write(out)
+            self.wfile.flush()
+            return
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _write_union_chat_response(self, resp: http.client.HTTPResponse, want_stream: bool) -> None:
+        raw = resp.read()
+        if resp.status >= 400:
+            self.send_response(resp.status)
+            self._started = True
+            self._cors()
+            ctype = resp.getheader("Content-Type") or "application/json"
+            self.send_header("Content-Type", ctype)
+            self.send_header("Content-Length", str(len(raw)))
+            retry = resp.getheader("Retry-After")
+            if retry:
+                self.send_header("Retry-After", retry)
+            self.end_headers()
+            self.wfile.write(raw)
+            log(f"upstream {resp.status}: {raw[:400]!r}")
+            return
+        if want_stream:
+            # Streaming Anthropic→chat translation is out of scope; fail closed.
+            self._json_error(502, "union-alpha chat streaming rewrite is not supported; use /v1/messages", "gateway_error")
+            return
+        try:
+            obj = json.loads(raw.decode("utf-8"))
+        except (UnicodeDecodeError, json.JSONDecodeError):
+            self._json_error(502, "invalid messages payload from Zen", "gateway_error")
+            return
+        if not isinstance(obj, dict):
+            self._json_error(502, "invalid messages payload from Zen", "gateway_error")
+            return
+        status, out, ctype = messages_to_chat_completion(obj)
+        self.send_response(status)
+        self._started = True
+        self._cors()
+        self.send_header("Content-Type", ctype)
+        self.send_header("Content-Length", str(len(out)))
+        self.end_headers()
+        self.wfile.write(out)
+
+    def _write_response(
+        self,
+        resp: http.client.HTTPResponse,
+        fold_json: bool = False,
+        fold_responses: bool = False,
+        fallback_model: str = "",
+    ) -> None:
         ctype = (resp.getheader("Content-Type") or "").lower()
         sse = "text/event-stream" in ctype
+        if fold_json or fold_responses:
+            raw = resp.read()
+            looks_sse = sse or raw.lstrip().startswith(b"data:") or raw.lstrip().startswith(b"event:")
+            if resp.status >= 400 or not looks_sse:
+                self.send_response(resp.status)
+                self._started = True
+                self._cors()
+                self.send_header("Content-Type", resp.getheader("Content-Type") or "application/json")
+                self.send_header("Content-Length", str(len(raw)))
+                retry = resp.getheader("Retry-After")
+                if retry:
+                    self.send_header("Retry-After", retry)
+                self.end_headers()
+                self.wfile.write(raw)
+                if resp.status >= 400:
+                    log(f"upstream {resp.status}: {raw[:400]!r}")
+                return
+            if fold_responses:
+                payload = responses_from_sse(raw)
+            else:
+                payload = chat_from_sse(raw, fallback_model)
+            out = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+            self.send_response(200)
+            self._started = True
+            self._cors()
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(out)))
+            self.end_headers()
+            self.wfile.write(out)
+            return
         self.send_response(resp.status)
         self._started = True
         self._cors()

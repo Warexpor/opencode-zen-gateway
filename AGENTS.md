@@ -1,6 +1,6 @@
 # opencode-zen-gateway
 
-Local reverse proxy. Other coding harnesses talk OpenAI- or Anthropic-shaped HTTP here; this process forwards to OpenCode Zen (`https://opencode.ai/zen`) with the caller’s Zen API key and official OpenCode client headers.
+Local reverse proxy. Other coding harnesses talk OpenAI- or Anthropic-shaped HTTP here; this process forwards to OpenCode Zen (`https://opencode.ai/zen`) with the caller’s Zen API key and the request shape Console's free tier currently accepts (semver User-Agent, `ses_` session id, `stream: true`, builtin tools in `builtin_tools.json`).
 
 | | |
 |--|--|

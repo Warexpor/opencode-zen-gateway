@@ -47,6 +47,50 @@ class Helpers(unittest.TestCase):
         self.assertEqual(gateway.strip_model_prefix("opencode/big-pickle"), "big-pickle")
         self.assertEqual(gateway.strip_model_prefix("big-pickle"), "big-pickle")
         self.assertEqual(gateway.strip_model_prefix("opencode-go/kimi-k2.5"), "kimi-k2.5")
+        self.assertEqual(gateway.strip_model_prefix("zen-gw/muse-spark-1.3-contributor-free"), "muse-spark-1.3-contributor-free")
+
+    def test_uses_responses_api(self):
+        self.assertTrue(gateway.uses_responses_api("muse-spark-1.3-contributor-free"))
+        self.assertTrue(gateway.uses_responses_api("zen-gw/muse-spark-1.2"))
+        self.assertFalse(gateway.uses_responses_api("big-pickle"))
+        self.assertFalse(gateway.uses_responses_api("mimo-v2.5-free"))
+
+    def test_chat_to_responses_and_back(self):
+        chat = {
+            "model": "zen-gw/muse-spark-1.3-contributor-free",
+            "messages": [
+                {"role": "system", "content": "Be brief."},
+                {"role": "user", "content": "Say hi"},
+            ],
+            "max_tokens": 64,
+            "stream": True,
+        }
+        translated = gateway.chat_to_responses_body(chat)
+        self.assertEqual(translated["model"], "muse-spark-1.3-contributor-free")
+        self.assertEqual(translated["max_output_tokens"], 256)
+        self.assertTrue(translated["stream"])
+        self.assertEqual(translated["reasoning"], {"effort": "minimal"})
+        self.assertEqual(translated["instructions"], "Be brief.")
+        self.assertEqual(translated["input"], [{"role": "user", "content": "Say hi"}])
+
+        fake = {
+            "id": "resp_test",
+            "created_at": 1700000000,
+            "status": "completed",
+            "model": "muse-spark-1.3-contributor-free",
+            "output": [{"content": [{"type": "output_text", "text": "hello"}]}],
+            "usage": {"input_tokens": 3, "output_tokens": 1},
+        }
+        status, body, ctype = gateway.responses_to_chat_completion(fake, want_stream=False)
+        self.assertEqual(status, 200)
+        self.assertEqual(ctype, "application/json")
+        out = json.loads(body.decode())
+        self.assertEqual(out["choices"][0]["message"]["content"], "hello")
+
+        status, sse, ctype = gateway.responses_to_chat_completion(fake, want_stream=True)
+        self.assertEqual(ctype, "text/event-stream")
+        self.assertIn(b"data: ", sse)
+        self.assertIn(b"[DONE]", sse)
 
     def test_rewrite_body_strips_prefix_only_when_needed(self):
         raw = json.dumps({"model": "opencode/big-pickle", "messages": []}).encode()
@@ -79,7 +123,38 @@ class Helpers(unittest.TestCase):
         c = gateway.session_for("key-b", None)
         self.assertEqual(a, b)
         self.assertNotEqual(a, c)
-        self.assertEqual(gateway.session_for("x", "ses_custom"), "ses_custom")
+        self.assertTrue(gateway.valid_oc_id(a))
+        kept = gateway.session_for("x", a)
+        self.assertEqual(kept, a)
+        rejected = gateway.session_for("fresh-key", "ses_custom")
+        self.assertNotEqual(rejected, "ses_custom")
+        self.assertTrue(gateway.valid_oc_id(rejected))
+
+    def test_apply_free_tier_tools_and_stream(self):
+        raw = json.dumps(
+            {
+                "model": "big-pickle",
+                "messages": [{"role": "user", "content": "hi"}],
+                "stream": False,
+                "tools": [
+                    {
+                        "type": "function",
+                        "function": {"name": "custom_tool", "parameters": {"type": "object"}},
+                    }
+                ],
+            }
+        ).encode()
+        out_b, meta = gateway.apply_free_tier("/v1/chat/completions", raw)
+        out = json.loads(out_b)
+        self.assertTrue(out["stream"])
+        self.assertTrue(meta["fold"])
+        self.assertFalse(meta["want_stream"])
+        names = [tool["function"]["name"] for tool in out["tools"]]
+        self.assertEqual(names[:11], [gateway.tool_name(tool) for tool in gateway.OFFICIAL_CHAT_TOOLS])
+        self.assertEqual(names[-1], "custom_tool")
+        translated = gateway.chat_to_responses_body(out)
+        self.assertTrue(translated["stream"])
+        self.assertIn("grep", [tool["name"] for tool in translated["tools"]])
 
     def test_split_sse_crlf(self):
         events, rest = gateway.split_sse(b'data: {"a":1}\r\n\r\ndata: {"b":2}\r\n\r\npartial')
@@ -216,7 +291,32 @@ class ProxyHTTP(unittest.TestCase):
         self.assertEqual(h.get("x-opencode-client"), "cli")
         self.assertTrue(h.get("x-opencode-session", "").startswith("ses_"))
         self.assertTrue(h.get("x-opencode-request", "").startswith("msg_"))
+        self.assertTrue(gateway.valid_oc_id(h.get("x-opencode-session", "")))
+        self.assertTrue(gateway.valid_oc_id(h.get("x-opencode-request", "")))
         self.assertEqual(h.get("authorization"), "Bearer oc-test")
+        names = [tool["function"]["name"] for tool in self.seen["body"]["tools"]]
+        self.assertIn("grep", names)
+        self.assertIn("glob", names)
+        self.assertTrue(self.seen["body"]["stream"])
+
+    def test_nonstream_client_gets_json(self):
+        req = Request(
+            f"http://127.0.0.1:{self.gw_port}/v1/chat/completions",
+            data=json.dumps(
+                {
+                    "model": "big-pickle",
+                    "messages": [{"role": "user", "content": "hi"}],
+                    "stream": False,
+                }
+            ).encode(),
+            headers={"Content-Type": "application/json", "Authorization": "Bearer oc-test"},
+            method="POST",
+        )
+        with urlopen(req, timeout=5) as resp:
+            self.assertIn("application/json", resp.headers.get("Content-Type", ""))
+            out = json.loads(resp.read())
+        self.assertEqual(out["choices"][0]["message"]["content"], "hi")
+        self.assertTrue(self.seen["body"]["stream"])
 
     def test_404_json(self):
         try:

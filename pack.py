@@ -7,7 +7,7 @@ import zipfile
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parent
-VERSION = "0.1.6"
+VERSION = "0.2.0"
 DIST = ROOT / "dist"
 NAME = f"opencode-zen-gateway-{VERSION}"
 OUT = DIST / f"{NAME}.zip"
@@ -15,6 +15,7 @@ OUT = DIST / f"{NAME}.zip"
 # What a recipient needs to run it. No .git, logs, socks5.url, .env, tests, AGENTS.md.
 FILES = [
     "gateway.py",
+    "builtin_tools.json",
     "START.cmd",
     "start.sh",
     "proxy-on.bat",

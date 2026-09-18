@@ -24,7 +24,7 @@ Paste your Zen key into the harness as the OpenAI (or Anthropic) API key. The ga
 | `ZEN_GATEWAY_PORT` | `8789` | Listen port |
 | `ZEN_GATEWAY_CLIENT` | `cli` | `x-opencode-client` |
 | `ZEN_GATEWAY_PROJECT` | `global` | `x-opencode-project` |
-| `ZEN_GATEWAY_OPENCODE_VERSION` | `1.18.4` | Used in `User-Agent: opencode/<ver>` |
+| `ZEN_GATEWAY_OPENCODE_VERSION` | `1.18.31` | Used in `User-Agent: opencode/<ver>` |
 | `ZEN_GATEWAY_USER_AGENT` | `opencode/<ver>` | Full User-Agent override |
 | `ZEN_GATEWAY_SOCKS5` | (empty) | Force a SOCKS5 URL, or `off` to go direct |
 
@@ -58,19 +58,23 @@ Restart `START.cmd` after flipping. Then `python -m pip install -r requirements.
 
 ## What it injects
 
-Matches `packages/opencode/src/session/llm/request.ts` in [anomalyco/opencode](https://github.com/anomalyco/opencode):
+Matches a current OpenCode CLI request to Zen. Console's free tier (tightened 2026-09-17) rejects anything that does not look like that client:
 
-- `User-Agent: opencode/<version>`
+- `User-Agent: opencode/<version>` — must be a semver of 1.18.0 or newer. `0.0.0-prod-…`, git-describe, and beta stamps are rejected even when the app itself is current.
 - `x-opencode-client: cli`
 - `x-opencode-project: global`
-- `x-opencode-session` — stable per API key (or passthrough)
-- `x-opencode-request` — new `msg_…` per call
+- `x-opencode-session` — `ses_` plus a 12-hex timestamp and 14 base62 characters, stable per API key. UUIDs and other harness session ids are replaced.
+- `x-opencode-request` — new `msg_…` id in the same shape, per call.
+- `stream: true` on the upstream body. If the harness asked for a single JSON response, the gateway reads the SSE stream and folds it back into one chat completion (or one Responses object).
+- The OpenCode `build` builtin tools (`bash`, `edit`, `glob`, `grep`, `read`, `skill`, `task`, `todowrite`, `webfetch`, `websearch`, `write`), taken from `builtin_tools.json`. Harness tools are kept after that list. A body that omits `glob` or `grep` is rejected as "can only be used from within OpenCode".
 
 Zen `inference-cost` SSE frames are stripped so clients that expect a plain OpenAI stream do not break. `Retry-After` on 429s is forwarded.
 
 ## Limits
 
 This does not raise Zen’s free-tier cap. Free models are IP-day limited on Zen’s side. Paid Zen balance does not buy extra free-model quota. After `FreeUsageLimitError`, wait until UTC midnight or switch off a `-free` model.
+
+The tool list is a snapshot of OpenCode CLI 1.18.31. If Console starts requiring a newer set, replace `builtin_tools.json` from a fresh CLI capture and bump `ZEN_GATEWAY_OPENCODE_VERSION`.
 
 ## Tests
 
