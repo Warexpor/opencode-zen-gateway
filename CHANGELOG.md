@@ -1,5 +1,11 @@
 # Changelog
 
+## 0.2.1 — 2026-09-18
+
+- Out-of-box launchers: `./zen-gateway` (Linux/macOS) and `zen-gateway.cmd` / `START.cmd` (Windows).
+- `install.sh` / `install.cmd` put `zen-gateway` on PATH. Linux SOCKS helpers: `proxy-on.sh` / `proxy-off.sh` / `proxy-status.sh`.
+- Loads `.env` next to the gateway if present (does not override already-set env vars).
+
 ## 0.2.0 — 2026-09-18
 
 - Free tier now requires a real semver User-Agent, an OpenCode session id, `stream: true`, and the builtin tool set. Default version is `1.18.31`.

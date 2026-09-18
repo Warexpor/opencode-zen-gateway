@@ -6,8 +6,8 @@ Local reverse proxy. Other coding harnesses talk OpenAI- or Anthropic-shaped HTT
 |--|--|
 | Listen | `http://127.0.0.1:8789` (`ZEN_GATEWAY_PORT`) |
 | Upstream | `https://opencode.ai/zen` |
-| Start | `START.cmd` or `python gateway.py` |
-| Tests | `python -m unittest tests.test_gateway -v` |
-| SOCKS5 | `proxy-on.bat` / `proxy-off.bat` (local `socks5.url`). Default `socks5://127.0.0.1:10808`. |
+| Start | `./zen-gateway` / `zen-gateway.cmd` / `START.cmd` (`./install.sh` or `install.cmd` puts it on PATH) |
+| Tests | `ZEN_GATEWAY_SOCKS5=off python -m unittest tests.test_gateway -v` |
+| SOCKS5 | `proxy-on` / `proxy-off` (`.sh` or `.bat`, local `socks5.url`). Default `socks5://127.0.0.1:10808`. |
 | Share | `PACK.cmd` → `dist/opencode-zen-gateway-*.zip` |
 | Stack | Python 3 stdlib. PySocks only if SOCKS5 is on. |

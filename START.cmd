@@ -15,10 +15,11 @@ echo  ============================================
 echo   OpenCode Zen gateway
 echo   http://127.0.0.1:8789/v1
 echo   Upstream: https://opencode.ai/zen
+echo   Health:   http://127.0.0.1:8789/healthz
 echo   SOCKS5: !SOCKS_STATE!
 if not "!SOCKS_URL!"=="" echo   !SOCKS_URL!
-echo   Optional: set OPENCODE_API_KEY
-echo   Logs: %~dp0logs\
+echo   Optional: copy .env.example to .env
+echo   Or install: install.cmd  then  zen-gateway
 echo   Close this window = stop
 echo  ============================================
 echo.

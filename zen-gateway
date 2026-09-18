@@ -1,0 +1,66 @@
+#!/bin/sh
+# Launch the OpenCode Zen gateway from any cwd.
+# Prefer: ./zen-gateway   or after install: zen-gateway
+set -eu
+ROOT=$(CDPATH= cd -- "$(dirname "$0")" && pwd)
+cd "$ROOT"
+
+SOCKS_STATE=OFF
+SOCKS_URL=
+ENV_SOCKS=$(printf '%s' "${ZEN_GATEWAY_SOCKS5:-}" | tr '[:upper:]' '[:lower:]')
+case "$ENV_SOCKS" in
+  off|0|false|no|direct|none|disable|disabled)
+    SOCKS_STATE=OFF
+    ;;
+  *)
+    if [ -n "${ZEN_GATEWAY_SOCKS5:-}" ]; then
+      SOCKS_STATE=ON
+      SOCKS_URL=$ZEN_GATEWAY_SOCKS5
+    elif [ -f "$ROOT/socks5.url" ]; then
+      SOCKS_STATE=ON
+      SOCKS_URL=$(tr -d '\r\n' < "$ROOT/socks5.url")
+    fi
+    ;;
+esac
+
+echo
+echo "  ============================================"
+echo "   OpenCode Zen gateway"
+echo "   http://127.0.0.1:${ZEN_GATEWAY_PORT:-8789}/v1"
+echo "   Upstream: https://opencode.ai/zen"
+echo "   Health:   http://127.0.0.1:${ZEN_GATEWAY_PORT:-8789}/healthz"
+echo "   SOCKS5:   $SOCKS_STATE"
+[ -n "$SOCKS_URL" ] && echo "   $SOCKS_URL"
+echo "   Optional: copy .env.example to .env"
+echo "   Ctrl+C = stop"
+echo "  ============================================"
+echo
+
+PY=
+for cand in python3 python; do
+  if command -v "$cand" >/dev/null 2>&1; then
+    if "$cand" -c "import sys; raise SystemExit(0 if sys.version_info >= (3, 9) else 1)" 2>/dev/null; then
+      PY=$cand
+      break
+    fi
+  fi
+done
+
+if [ -z "$PY" ]; then
+  echo "ERROR: Python 3.9+ not found on PATH." >&2
+  echo "  Install python3, then retry." >&2
+  exit 1
+fi
+
+if [ "$SOCKS_STATE" = ON ]; then
+  if ! "$PY" -c "import socks" 2>/dev/null; then
+    echo "ERROR: SOCKS5 is ON but this Python has no PySocks:" >&2
+    "$PY" -c "import sys; print(' ', sys.executable)" >&2
+    echo "  Install:  $PY -m pip install -r requirements.txt" >&2
+    echo "  Or run:   ./proxy-off.sh" >&2
+    exit 1
+  fi
+fi
+
+echo "Using: $PY ($("$PY" -c 'import sys; print(sys.executable)'))"
+exec "$PY" "$ROOT/gateway.py"

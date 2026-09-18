@@ -25,6 +25,32 @@ from pathlib import Path
 from typing import Dict, List, NamedTuple, Optional, Tuple
 from urllib.parse import unquote, urlsplit
 
+ROOT = Path(__file__).resolve().parent
+SOCKS_SWITCH = ROOT / "socks5.url"
+
+
+def _load_dotenv(path: Path) -> None:
+    """Load KEY=VALUE from .env without overriding existing environment vars."""
+    try:
+        text = path.read_text(encoding="utf-8")
+    except OSError:
+        return
+    for raw in text.splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#") or "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        if not key or key in os.environ:
+            continue
+        value = value.strip()
+        if len(value) >= 2 and value[0] == value[-1] and value[0] in "\"'":
+            value = value[1:-1]
+        os.environ[key] = value
+
+
+_load_dotenv(ROOT / ".env")
+
 HOST = "127.0.0.1"
 PORT = int(os.environ.get("ZEN_GATEWAY_PORT", "8789"))
 UPSTREAM = os.environ.get("ZEN_GATEWAY_UPSTREAM", "https://opencode.ai/zen").rstrip("/")
@@ -36,8 +62,6 @@ USER_AGENT = os.environ.get(
 )
 ENV_KEY = os.environ.get("OPENCODE_API_KEY", "").strip()
 UPSTREAM_TIMEOUT = int(os.environ.get("ZEN_GATEWAY_TIMEOUT", "600"))
-ROOT = Path(__file__).resolve().parent
-SOCKS_SWITCH = ROOT / "socks5.url"
 # Schemas captured from OpenCode CLI 1.18.31 `build` on 2026-09-18.
 # Console's free tier rejects inference bodies that do not contain this set.
 _OFFICIAL_TOOLS_PATH = ROOT / "builtin_tools.json"

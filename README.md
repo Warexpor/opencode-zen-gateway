@@ -10,11 +10,24 @@ Python 3 stdlib only. PySocks is optional and only required when SOCKS5 is on.
 
 ## Run
 
-Windows: `START.cmd`
+**Linux / macOS**
 
-Unix: `sh start.sh` or `python3 gateway.py`
+```sh
+./zen-gateway
+# or once:  ./install.sh   then anywhere:  zen-gateway
+```
+
+**Windows**
+
+```bat
+zen-gateway.cmd
+REM or double-click START.cmd
+REM or once:  install.cmd   then a new terminal:  zen-gateway
+```
 
 Health: `http://127.0.0.1:8789/healthz`
+
+Copy `.env.example` to `.env` if you want a local key/port without exporting shell vars. The gateway loads `.env` automatically and never overrides variables already in the environment.
 
 Paste your Zen key into the harness as the OpenAI (or Anthropic) API key. The gateway forwards `Authorization`. Set `OPENCODE_API_KEY` only if you want the gateway to override whatever the harness sends.
 
@@ -46,15 +59,17 @@ Current list: [opencode.ai/docs/zen](https://opencode.ai/docs/zen)
 
 ## SOCKS5
 
-Harnesses still connect to `127.0.0.1:8789`. Only the gateway’s calls to `opencode.ai` go through the proxy. This does not set Windows-wide `HTTP_PROXY`.
+Harnesses still connect to `127.0.0.1:8789`. Only the gateway’s calls to `opencode.ai` go through the proxy. This does not set a system-wide `HTTP_PROXY`.
 
-- `proxy-on.bat` — ON, default `socks5://127.0.0.1:10808`
-- `proxy-off.bat` — OFF, direct to Zen
-- `proxy-status.bat` — current switch
+| | Linux / macOS | Windows |
+|---|---|---|
+| ON (default `socks5://127.0.0.1:10808`) | `./proxy-on.sh` | `proxy-on.bat` |
+| OFF | `./proxy-off.sh` | `proxy-off.bat` |
+| Status | `./proxy-status.sh` | `proxy-status.bat` |
 
-Optional: `proxy-on.bat socks5://user:pass@127.0.0.1:1080`
+Optional: `./proxy-on.sh socks5://user:pass@127.0.0.1:1080`
 
-Restart `START.cmd` after flipping. Then `python -m pip install -r requirements.txt` if PySocks is missing. `START.cmd` prefers `py -3` so a random venv `python` on PATH is not used.
+Restart the gateway after flipping. Then `python3 -m pip install -r requirements.txt` if PySocks is missing.
 
 ## What it injects
 

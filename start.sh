@@ -1,3 +1,3 @@
 #!/bin/sh
-cd "$(dirname "$0")"
-exec python3 gateway.py
+# Back-compat alias. Prefer: ./zen-gateway
+exec "$(CDPATH= cd -- "$(dirname "$0")" && pwd)/zen-gateway" "$@"
